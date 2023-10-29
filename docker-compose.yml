@@ -5,6 +5,8 @@ services:
     image: redis:latest
     ports:
       - "${REDIS_PORT}:6379"
+    networks:
+      - external_network
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
 
@@ -12,6 +14,8 @@ services:
     image: postgres:latest
     ports:
       - "${POSTGRES_PORT}:5432"
+    networks:
+      - external_network
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -22,6 +26,8 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - external_network
 
   kafka:
     image: confluentinc/cp-kafka:latest
@@ -29,14 +35,16 @@ services:
       - zookeeper
     ports:
       - "${KAFKA_PORT}:9092"
+    networks:
+      - external_network
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_ADVERTISED_LISTENERS: LISTENER_DOCKER_INTERNAL://kafka:19092,LISTENER_DOCKER_EXTERNAL://${DOCKER_HOST_IP}:${KAFKA_PORT}
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: LISTENER_DOCKER_INTERNAL:PLAINTEXT,LISTENER_DOCKER_EXTERNAL:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: LISTENER_DOCKER_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 
 networks:
-  default:
-    external:
-      name: host
+  external_network:
+    name: ptp-network

@@ -10,28 +10,27 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
-	"sync"
 	"syscall"
 	"time"
 
+	"github.com/confluentinc/confluent-kafka-go/kafka"
 	"github.com/gorilla/websocket"
-	"github.com/redis/go-redis/v9"
-	"gorm.io/driver/sqlite"
+	"github.com/jalilbengoufa/ptp/internal/database"
 	"gorm.io/gorm"
 )
 
 const (
 	// Time allowed to write the file to the client.
-	writeWait = 1 * time.Second
+	writeWait = 5 * time.Second
 
 	// Time allowed to read the next pong message from the client.
-	pongWait = 1 * time.Second
+	pongWait = 30 * time.Second
 
 	// Send pings to client with this period. Must be less than pongWait.
 	pingPeriod = (pongWait * 9) / 10
 
 	// Poll file for changes with this period.
-	filePeriod = 1 * time.Second
+	filePeriod = 2 * time.Second
 )
 
 var (
@@ -42,27 +41,14 @@ var (
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
 	}
+	databaseSqlite   *gorm.DB
+	databasePostgres *gorm.DB
 )
-
-var (
-	dbInstanceSqlite *gorm.DB
-	sqliteMutex      sync.Mutex
-	client           *redis.Client
-)
-
-type File struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Content string `json:"content"`
-}
 
 func readFileIfModified(lastMod time.Time) ([]byte, time.Time, error) {
 	fi, err := os.Stat(filename)
 	if err != nil {
 		return nil, lastMod, err
-	}
-	if !fi.ModTime().After(lastMod) {
-		return nil, lastMod, nil
 	}
 	p, err := os.ReadFile(filepath.Clean(filename))
 	if err != nil {
@@ -96,31 +82,39 @@ func writer(ws *websocket.Conn, lastMod time.Time) {
 	for {
 		select {
 		case <-fileTicker.C:
-			var content []byte
+			var p []byte
 			var err error
 
-			content, lastMod, err = readFileIfModified(lastMod)
+			p, lastMod, err = readFileIfModified(lastMod)
 
 			if err != nil {
 				if s := err.Error(); s != lastError {
 					lastError = s
-					content = []byte(lastError)
+					p = []byte(lastError)
 				}
 			} else {
 				lastError = ""
 			}
+			if p != nil {
 
-			if content != nil {
 				// Save to sqlite
-				file := File{ID: "1", Name: filename, Content: string(content)}
-				dbInstanceSqlite.Save(&file)
+				file := database.File{ID: "1", Name: filename, Content: string(p)}
+				databaseSqlite.Save(&file)
 
 				// Read from sqlite
-				var fileText File
-				dbInstanceSqlite.First(&fileText, 1)
+				var fileText database.File
+				databaseSqlite.First(&fileText, file.ID)
 				fmt.Println("Read from sqlite:", fileText.Content)
 
-				// save to redis
+				// Save to postgres
+				databasePostgres.Save(&file)
+
+				// Read from postgres
+				var fileTextPostgres database.File
+				databasePostgres.First(&fileTextPostgres, file.ID)
+				fmt.Println("Read from postgres:", fileTextPostgres.Content)
+
+				//save to redis
 				// ctx := context.Background()
 
 				// err = client.Set(ctx, "1", content, 0).Err()
@@ -128,7 +122,7 @@ func writer(ws *websocket.Conn, lastMod time.Time) {
 				// 	log.Fatal(err)
 				// }
 
-				// // read from redis
+				// read from redis
 				// val, err := client.Get(ctx, "1").Result()
 				// if err != nil {
 				// 	log.Fatal(err)
@@ -136,7 +130,7 @@ func writer(ws *websocket.Conn, lastMod time.Time) {
 				// fmt.Println("Read from redis:", val)
 
 				ws.SetWriteDeadline(time.Now().Add(writeWait))
-				if err := ws.WriteMessage(websocket.TextMessage, content); err != nil {
+				if err := ws.WriteMessage(websocket.TextMessage, p); err != nil {
 					return
 				}
 			}
@@ -199,10 +193,100 @@ func main() {
 
 	go closeOnSignal()
 
-	err := InitSqliteDbInstance()
+	initSqliteDB, err := database.InitSqliteDbInstance()
 	if err != nil {
 		fmt.Printf("Failed to connect to the database sqlite: %v", err)
 	}
+	databaseSqlite = initSqliteDB
+
+	initPostgresDB, err := database.InitPostgresDbInstance()
+	if err != nil {
+		fmt.Printf("Failed to connect to the database postgres: %v", err)
+	}
+	databasePostgres = initPostgresDB
+
+	p, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers": "localhost:9092",
+		"client.id":         "ptp-client",
+		"acks":              "all"})
+
+	if err != nil {
+		fmt.Printf("Failed to create producer: %s\n", err)
+
+	}
+	defer p.Close()
+	consumer, err := kafka.NewConsumer(&kafka.ConfigMap{
+		"bootstrap.servers": "localhost:9092",
+		"group.id":          "ptp-group",
+		"auto.offset.reset": "smallest"})
+
+	if err != nil {
+		fmt.Printf("Failed to create consumer: %s\n", err)
+
+	}
+
+	// Delivery report handler for produced messages
+	go func() {
+		for e := range p.Events() {
+			switch ev := e.(type) {
+			case *kafka.Message:
+				if ev.TopicPartition.Error != nil {
+					fmt.Printf("Delivery failed: %v\n", ev.TopicPartition)
+				} else {
+					fmt.Printf("Delivered message to %v\n", ev.TopicPartition)
+				}
+			}
+		}
+	}()
+
+	// Produce messages to topic (asynchronously)
+	topic := "myTopic"
+	for _, word := range []string{"Welcome", "to", "the", "Confluent", "Kafka", "Golang", "client"} {
+		p.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+			Value:          []byte(word),
+		}, nil)
+	}
+
+	// Wait for message deliveries before shutting down
+	p.Flush(15 * 1000)
+
+	// go func() {
+	// 	for e := range p.Events() {
+	// 		switch ev := e.(type) {
+	// 		case *kafka.Message:
+	// 			if ev.TopicPartition.Error != nil {
+	// 				fmt.Printf("Failed to deliver message: %v\n", ev.TopicPartition)
+	// 			} else {
+	// 				fmt.Printf("Produced event to topic %s: key = %-10s value = %s\n",
+	// 					*ev.TopicPartition.Topic, string(ev.Key), string(ev.Value))
+	// 			}
+	// 		}
+	// 	}
+	// }()
+
+	consumer.SubscribeTopics([]string{"myTopic", "^aRegex.*[Tt]opic"}, nil)
+	if err != nil {
+		fmt.Printf("Failed to SubscribeTopics: %s\n", err)
+
+	}
+
+	// A signal handler or similar could be used to set this to false to break the loop.
+	run := true
+
+	for run {
+		msg, err := consumer.ReadMessage(time.Second)
+		if err == nil {
+			fmt.Printf("Message on %s: %s\n", msg.TopicPartition, string(msg.Value))
+		} else {
+			// The client will automatically try to recover from all errors.
+			// Timeout is not considered an error because it is raised by
+			// ReadMessage in absence of messages.
+			fmt.Printf("Consumer error: %v (%v)\n", err, msg)
+		}
+	}
+
+	consumer.Close()
 
 	// client = redis.NewClient(&redis.Options{
 	// 	Addr:     "localhost:6379",
@@ -221,49 +305,12 @@ func main() {
 	}
 
 }
-func InitSqliteDbInstance() error {
-	sqliteMutex.Lock()
-	defer sqliteMutex.Unlock()
-
-	if dbInstanceSqlite == nil {
-		db, err := gorm.Open(sqlite.Open("gorm.db"), &gorm.Config{})
-		if err != nil {
-			return err
-		}
-
-		migrationPath := "migrations/file.sql"
-		if err := runMigrations(db, migrationPath); err != nil {
-			return fmt.Errorf("failed to run migrations: %v", err)
-		}
-
-		dbInstanceSqlite = db
-	}
-
-	if dbInstanceSqlite == nil {
-		return fmt.Errorf("failed to initialize SQLite DB instance")
-	}
-	return nil
-}
 
 func closeOnSignal() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	<-quit
 	os.Exit(0)
-}
-
-func runMigrations(db *gorm.DB, filePath string) error {
-	migrations, err := os.ReadFile(filePath)
-	if err != nil {
-		return err
-	}
-
-	// Execute the migrations with gorm
-	if err = db.Exec(string(migrations)).Error; err != nil {
-		return err
-	}
-
-	return nil
 }
 
 const homeHTML = `<!DOCTYPE html>
