@@ -2,7 +2,7 @@ version: "3"
 
 services:
   redis:
-    image: redis:latest
+    image: redis:7.2.2
     ports:
       - "${REDIS_PORT}:6379"
     networks:
@@ -11,7 +11,7 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
 
   postgres:
-    image: postgres:latest
+    image: postgres:16.0
     ports:
       - "${POSTGRES_PORT}:5432"
     networks:
@@ -22,7 +22,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
 
   zookeeper:
-    image: confluentinc/cp-zookeeper:latest
+    image: confluentinc/cp-zookeeper:7.5.1
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
@@ -30,7 +30,7 @@ services:
       - external_network
 
   kafka:
-    image: confluentinc/cp-kafka:latest
+    image: confluentinc/cp-kafka:7.5.1
     depends_on:
       - zookeeper
     ports:
